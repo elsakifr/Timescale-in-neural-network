@@ -1,68 +1,51 @@
 from brian2 import *
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
 start_scope()
 
-# -------------------
-# Settings
-# -------------------
-defaultclock.dt = 0.1*ms
-duration = 1000*ms
-
+# Parametrar
 N = 100
+tau_value = 20*ms
+duration = 1000*ms
+defaultclock.dt = 1*ms
 
-# -------------------
-# Model parameters
-# -------------------
-tau = 20*ms
-w_rec = 0.15
-I_ext = 0.5
+# Enkel extern input
+I0 = 0.5
 
-# -------------------
-# Rate-based equations
-# -------------------
+# Rate-modell
 eqs = '''
-dr/dt = (-r + tanh(total_input))/tau : 1
-total_input : 1
+dr/dt = (-r + tanh(x)) / tau : 1
+x : 1
+tau : second
+Iext : 1
 '''
 
 G = NeuronGroup(N, eqs, method='euler')
-G.r = '0.1*rand()'
-G.total_input = I_ext
 
-# recurrent weight matrix
-W = np.random.normal(0, w_rec/np.sqrt(N), size=(N, N))
-np.fill_diagonal(W, 0)
+# Initialvärden
+G.r = '0.1 * rand()'
+G.tau = tau_value
+G.Iext = I0
 
-# Brian2 Synapses object
-S = Synapses(G, G, model='w : 1', on_pre='')
-S.connect()
-S.w = W.flatten()
+# Viktmatris
+W = 0.1 * np.random.randn(N, N)
 
-# update total input manually each timestep
+# Manuell uppdatering av recurrent input
 @network_operation(dt=defaultclock.dt)
 def update_input():
-    G.total_input = I_ext + np.dot(W, G.r)
+    G.x = W @ G.r[:] + G.Iext[:]
 
-# -------------------
-# Monitors
-# -------------------
+# Monitor
 M = StateMonitor(G, 'r', record=True)
 
-# -------------------
-# Run
-# -------------------
 run(duration)
 
-# -------------------
-# Plot
-# -------------------
-plt.figure(figsize=(10, 6))
+# Plot några neuroner
+plt.figure(figsize=(8,4))
 for i in range(5):
     plt.plot(M.t/ms, M.r[i], label=f'Neuron {i}')
-plt.xlabel('Time (ms)')
-plt.ylabel('Rate activity')
-plt.title('Rate-based neural activity')
-plt.legend()
+plt.xlabel('Tid (ms)')
+plt.ylabel('Aktivitet r')
+plt.title('Homogent rate-nätverk')
 plt.show()
