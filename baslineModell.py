@@ -1,4 +1,5 @@
 from brian2 import *
+from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -111,6 +112,34 @@ std_of_mean_activity = np.std(all_mean_activity, axis=0)
 
 mean_corr = np.mean(all_corr, axis=0)
 std_corr = np.std(all_corr, axis=0)
+
+
+def exp_decay(t, tau):
+    return np.exp(-t / tau)
+
+fit_max_lag = 100
+
+corr_curve = mean_corr
+lag_curve = lags[:len(corr_curve)]
+
+mask = (lag_curve > 0) & (lag_curve <= fit_max_lag)
+
+x_fit = lag_curve[mask]
+y_fit = corr_curve[mask]
+
+popt, _ = curve_fit(
+    exp_decay,
+    x_fit,
+    y_fit,
+    p0=(20.0,),
+    bounds=([1], [1000])
+)
+
+tau_eff_baseline = popt[0]
+
+print(
+    f"Baseline intrinsic timescale = {tau_eff_baseline:.2f} ms"
+)
 
 # -------------------
 # Plot 1: representative single-neuron activity
