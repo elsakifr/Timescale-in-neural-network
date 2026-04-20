@@ -25,7 +25,7 @@ def estimate_timescale(corr, lags, threshold=0.8):
 num_runs = 20
 ei_ratios = [0.8, 0.7, 0.6, 0.5]   # fraction excitatory
 N = 100
-duration = 3000 * ms
+duration = 4000 * ms
 dt = 0.1 * ms
 
 baseline_input = 0.0
@@ -72,7 +72,7 @@ for ratio in ei_ratios:
         '''
 
         G = NeuronGroup(N, eqs, method='euler')
-        G.r = '0.05 * rand()'
+        G.r = 0 #'0.05 * rand()'
         G.tau_i = tau_baseline
         G.total_input = baseline_input
 
