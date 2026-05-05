@@ -157,7 +157,6 @@ plt.tight_layout()
 plt.figure(figsize=(8, 5))
 Ns = list(results_timescale.keys())
 taus = [results_timescale[N] for N in Ns]
-
 plt.plot(Ns, taus, 'o-')
 plt.xlabel('Network size (N)')
 plt.ylabel('Estimated timescale (ms)')
