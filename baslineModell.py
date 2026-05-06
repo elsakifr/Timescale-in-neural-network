@@ -78,16 +78,19 @@ def estimate_timescale_from_return_to_baseline(
 
 
 # -------------------
-# Connectivity: balanced E/I baseline
+# Connectivity: Case 2 fixed outdegree, balanced E/I
 # -------------------
-def build_balanced_baseline_connectivity(
+def build_balanced_fixed_outdegree_connectivity(
     N,
     exc_percent=50,
-    w_exc=0.05,
+    w_exc=0.04,
     con_prob=0.2,
 ):
     NE = int(round(N * exc_percent / 100))
     NI = N - NE
+
+    if NI == 0:
+        raise ValueError("NI cannot be zero.")
 
     con_mat = np.zeros((N, N))
 
@@ -99,10 +102,7 @@ def build_balanced_baseline_connectivity(
         tgt_ids = np.random.choice(possible_targets, size=no_con, replace=False)
         con_mat[tgt_ids, j] = 1
 
-    # first NE columns are excitatory
     con_mat[:, :NE] *= w_exc
-
-    # last NI columns are inhibitory
     con_mat[:, NE:] *= w_inh
 
     return con_mat, NE, NI
@@ -112,7 +112,7 @@ def build_balanced_baseline_connectivity(
 # Simulation settings
 # -------------------
 num_runs = 10
-N = 500
+network_sizes = [50, 100, 200, 500]
 
 duration = 4000 * ms
 dt = 0.1 * ms
@@ -128,161 +128,169 @@ w_exc = 0.04
 con_prob = 0.2
 noise_sigma = 0.1
 
-all_mean_activity = []
-all_corr = []
-
-representative_W = None
+# -------------------
+# Storage
+# -------------------
+results_mean_activity = {}
+results_std_activity = {}
+results_mean_corr = {}
+results_std_corr = {}
+results_timescale = {}
+results_time = {}
+results_lags = {}
 
 # -------------------
-# Run simulations
+# Loop over network sizes
 # -------------------
-for run_id in range(num_runs):
-    start_scope()
+for N in network_sizes:
+    all_mean_activity = []
+    all_corr = []
 
-    current_seed = 10000 + run_id
-    seed(current_seed)
-    np.random.seed(current_seed)
-    defaultclock.dt = dt
+    print(f"\nRunning network size N = {N}")
 
-    W, NE, NI = build_balanced_baseline_connectivity(
-        N=N,
-        exc_percent=50,
-        w_exc=w_exc,
-        con_prob=con_prob,
+    for run_id in range(num_runs):
+        start_scope()
+
+        current_seed = 10000 * run_id + N
+        seed(current_seed)
+        np.random.seed(current_seed)
+        defaultclock.dt = dt
+
+        W, NE, NI = build_balanced_fixed_outdegree_connectivity(
+            N=N,
+            exc_percent=50,
+            w_exc=w_exc,
+            con_prob=con_prob,
+        )
+
+        if run_id == 0:
+            row_sums = np.sum(W, axis=1)
+            col_sums = np.sum(W, axis=0)
+
+            print(f"E/I = {NE}/{NI}")
+            print(f"Total W sum: {np.sum(W):.10f}")
+            print(f"Mean row sum: {np.mean(row_sums):.10f}")
+            print(f"Std row sum: {np.std(row_sums):.10f}")
+            print(f"Mean col sum: {np.mean(col_sums):.10f}")
+            print(f"Std col sum: {np.std(col_sums):.10f}")
+
+        eqs = '''
+        dr/dt = (-r + tanh(total_input))/tau_i : 1
+        total_input : 1
+        tau_i : second
+        '''
+
+        G = NeuronGroup(N, eqs, method="euler")
+        G.r = "0.05 * rand()"
+        G.tau_i = tau_baseline
+        G.total_input = baseline_input
+
+        @network_operation(dt=defaultclock.dt)
+        def update_input():
+            if pulse_start <= defaultclock.t < pulse_end:
+                input_signal = pulse_amplitude
+            else:
+                input_signal = baseline_input
+
+            if noise_sigma > 0:
+                noise = noise_sigma * np.random.randn(N)
+            else:
+                noise = 0
+
+            G.total_input = input_signal + np.dot(W, G.r) + noise
+
+        M = StateMonitor(G, "r", record=True)
+
+        run(duration)
+
+        mean_activity = np.asarray(np.mean(M.r, axis=0))
+        corr = autocorrelation(mean_activity)
+
+        all_mean_activity.append(mean_activity)
+        all_corr.append(corr[:1000])
+
+        if run_id == 0:
+            time_ms = np.asarray(M.t / ms)
+            lags_ms = np.arange(len(corr)) * float(defaultclock.dt / ms)
+
+    all_mean_activity = np.vstack(all_mean_activity)
+    all_corr = np.vstack(all_corr)
+
+    results_mean_activity[N] = np.mean(all_mean_activity, axis=0)
+    results_std_activity[N] = np.std(all_mean_activity, axis=0)
+
+    results_mean_corr[N] = np.mean(all_corr, axis=0)
+    results_std_corr[N] = np.std(all_corr, axis=0)
+
+    results_time[N] = time_ms
+    results_lags[N] = lags_ms[:1000]
+
+    results_timescale[N] = estimate_timescale_from_return_to_baseline(
+        results_mean_activity[N],
+        results_time[N],
+        pulse_start / ms,
+        pulse_end / ms,
     )
-
-    if run_id == 0:
-        representative_W = W.copy()
-
-        row_sums = np.sum(W, axis=1)
-        col_sums = np.sum(W, axis=0)
-
-        print(f"Baseline E/I = {NE}/{NI}")
-        print(f"Total W sum: {np.sum(W):.10f}")
-        print(f"Mean row sum: {np.mean(row_sums):.10f}")
-        print(f"Std row sum: {np.std(row_sums):.10f}")
-        print(f"Mean col sum: {np.mean(col_sums):.10f}")
-        print(f"Std col sum: {np.std(col_sums):.10f}")
-        print(f"Min excitatory weight: {np.min(W[:, :NE]):.6f}")
-        print(f"Max inhibitory weight: {np.max(W[:, NE:]):.6f}")
-
-    eqs = '''
-    dr/dt = (-r + tanh(total_input))/tau_i : 1
-    total_input : 1
-    tau_i : second
-    '''
-
-    G = NeuronGroup(N, eqs, method="euler")
-    G.r = "0.05 * rand()"
-    G.tau_i = tau_baseline
-    G.total_input = baseline_input
-
-    @network_operation(dt=defaultclock.dt)
-    def update_input():
-        if pulse_start <= defaultclock.t < pulse_end:
-            input_signal = pulse_amplitude
-        else:
-            input_signal = baseline_input
-
-        if noise_sigma > 0:
-            noise = noise_sigma * np.random.randn(N)
-        else:
-            noise = 0
-
-        G.total_input = input_signal + np.dot(W, G.r) + noise
-
-    M = StateMonitor(G, "r", record=True)
-
-    run(duration)
-
-    mean_activity = np.asarray(np.mean(M.r, axis=0))
-    corr = autocorrelation(mean_activity)
-
-    all_mean_activity.append(mean_activity)
-    all_corr.append(corr[:1000])
-
-    if run_id == 0:
-        time_ms = np.asarray(M.t / ms)
-        lags_ms = np.arange(len(corr)) * float(defaultclock.dt / ms)
-
-
-# -------------------
-# Average results
-# -------------------
-all_mean_activity = np.vstack(all_mean_activity)
-all_corr = np.vstack(all_corr)
-
-mean_activity_avg = np.mean(all_mean_activity, axis=0)
-std_activity = np.std(all_mean_activity, axis=0)
-
-mean_corr = np.mean(all_corr, axis=0)
-std_corr = np.std(all_corr, axis=0)
-
-lags_ms = lags_ms[:1000]
-
-tau_est = estimate_timescale_from_return_to_baseline(
-    mean_activity_avg,
-    time_ms,
-    pulse_start / ms,
-    pulse_end / ms,
-)
-
-print("\nEstimated baseline timescale:")
-if np.isnan(tau_est):
-    print("Undefined")
-else:
-    print(f"{tau_est:.2f} ms")
-
 
 # -------------------
 # Plot 1: mean activity
 # -------------------
 plt.figure(figsize=(10, 6))
-plt.plot(time_ms, mean_activity_avg, label="Mean activity")
-plt.fill_between(
-    time_ms,
-    mean_activity_avg - std_activity,
-    mean_activity_avg + std_activity,
-    alpha=0.2,
-    label="±1 std",
-)
+for N in network_sizes:
+    plt.plot(results_time[N], results_mean_activity[N], label=f"N = {N}")
+
 plt.axvspan(pulse_start / ms, pulse_end / ms, alpha=0.2, label="Input pulse")
 plt.xlabel("Time (ms)")
 plt.ylabel("Mean activity")
-plt.title("Baseline balanced E/I network: mean population activity")
+plt.title("Effect of network size: mean population activity")
 plt.legend()
 plt.tight_layout()
-
 
 # -------------------
 # Plot 2: autocorrelation
 # -------------------
 plt.figure(figsize=(10, 6))
-plt.plot(lags_ms, mean_corr, label="Mean autocorrelation")
-plt.fill_between(
-    lags_ms,
-    mean_corr - std_corr,
-    mean_corr + std_corr,
-    alpha=0.2,
-    label="±1 std",
-)
+for N in network_sizes:
+    plt.plot(results_lags[N], results_mean_corr[N], label=f"N = {N}")
+
 plt.xlabel("Lag (ms)")
 plt.ylabel("Autocorrelation")
-plt.title("Baseline balanced E/I network: autocorrelation")
+plt.title("Effect of network size: autocorrelation")
 plt.legend()
 plt.tight_layout()
 
+# -------------------
+# Plot 3: timescale vs network size
+# -------------------
+plt.figure(figsize=(8, 5))
 
-# -------------------
-# Plot 3: connectivity matrix
-# -------------------
-plt.figure(figsize=(7, 6))
-absmax = np.max(np.abs(representative_W))
-plt.imshow(representative_W, cmap="bwr", aspect="auto", vmin=-absmax, vmax=absmax)
-plt.colorbar(label="Connection strength")
-plt.xlabel("Presynaptic neuron j")
-plt.ylabel("Postsynaptic neuron i")
-plt.title("Baseline balanced E/I connectivity matrix")
+valid_N = []
+valid_tau = []
+
+for N in network_sizes:
+    tau = results_timescale[N]
+    if np.isnan(tau):
+        plt.scatter(N, 0, marker="x", s=100)
+        plt.text(N, 5, "undefined", ha="center")
+    else:
+        valid_N.append(N)
+        valid_tau.append(tau)
+
+if len(valid_N) > 0:
+    plt.plot(valid_N, valid_tau, "o-", label="Estimated timescale")
+
+plt.xlabel("Network size (N)")
+plt.ylabel("Estimated timescale (ms)")
+plt.title("Effect of network size: estimated post-pulse time constant")
+plt.legend()
 plt.tight_layout()
 
 plt.show()
+
+print("\nEstimated timescales:")
+for N in network_sizes:
+    tau = results_timescale[N]
+    if np.isnan(tau):
+        print(f"N = {N}: undefined")
+    else:
+        print(f"N = {N}: {tau:.2f} ms")
