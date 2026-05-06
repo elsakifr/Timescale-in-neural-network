@@ -1,73 +1,181 @@
 from brian2 import *
-from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.optimize import curve_fit
+
+prefs.codegen.target = "numpy"
 
 # -------------------
-# Helper function
+# Helper functions
 # -------------------
+def exp_decay(t, A, tau):
+    return A * np.exp(-t / tau)
+
+
 def autocorrelation(x):
     x = np.asarray(x)
     x = x - np.mean(x)
-    corr = np.correlate(x, x, mode='full')
+    corr = np.correlate(x, x, mode="full")
     corr = corr[corr.size // 2:]
-    corr = corr / corr[0]
-    return corr
+
+    if corr[0] == 0:
+        return np.full_like(corr, np.nan)
+
+    return corr / corr[0]
+
+
+def estimate_timescale_from_return_to_baseline(
+    mean_activity,
+    time_ms,
+    pulse_start_ms,
+    pulse_end_ms,
+    min_amplitude=0.02,
+    return_fraction=0.25,
+):
+    time_ms = np.asarray(time_ms)
+    y = np.asarray(mean_activity)
+
+    baseline_mask = (time_ms >= pulse_start_ms - 200) & (time_ms < pulse_start_ms)
+    baseline = np.mean(y[baseline_mask])
+
+    post_mask = time_ms >= pulse_end_ms
+    t_post = time_ms[post_mask] - pulse_end_ms
+    y_post = y[post_mask]
+
+    response = y_post - baseline
+
+    initial_window = (t_post >= 0) & (t_post <= 50)
+    A0 = np.mean(response[initial_window])
+
+    if A0 <= min_amplitude:
+        return np.nan
+
+    tail_len = max(20, len(response) // 5)
+    final_response = np.mean(response[-tail_len:])
+
+    if abs(final_response) > return_fraction * abs(A0):
+        return np.nan
+
+    fit_mask = response > 0.05 * A0
+    t_fit = t_post[fit_mask]
+    y_fit = response[fit_mask]
+
+    if len(y_fit) < 30:
+        return np.nan
+
+    try:
+        popt, _ = curve_fit(
+            exp_decay,
+            t_fit,
+            y_fit,
+            p0=(A0, 100.0),
+            bounds=([0, 1e-6], [np.inf, np.inf]),
+            maxfev=10000,
+        )
+        return popt[1]
+    except RuntimeError:
+        return np.nan
+
 
 # -------------------
-# Baseline settings
+# Connectivity: balanced E/I baseline
 # -------------------
-num_runs = 20
-N = 100
-duration = 3000 * ms
+def build_balanced_baseline_connectivity(
+    N,
+    exc_percent=50,
+    w_exc=0.05,
+    con_prob=0.2,
+):
+    NE = int(round(N * exc_percent / 100))
+    NI = N - NE
+
+    con_mat = np.zeros((N, N))
+
+    no_con = int(round(con_prob * N))
+    w_inh = -w_exc * (NE / NI)
+
+    for j in range(N):
+        possible_targets = np.array([i for i in range(N) if i != j])
+        tgt_ids = np.random.choice(possible_targets, size=no_con, replace=False)
+        con_mat[tgt_ids, j] = 1
+
+    # first NE columns are excitatory
+    con_mat[:, :NE] *= w_exc
+
+    # last NI columns are inhibitory
+    con_mat[:, NE:] *= w_inh
+
+    return con_mat, NE, NI
+
+
+# -------------------
+# Simulation settings
+# -------------------
+num_runs = 10
+N = 500
+
+duration = 4000 * ms
 dt = 0.1 * ms
 
-w_rec = 0.6
-baseline_input = 0.0
-pulse_amplitude = 0.8
 pulse_start = 500 * ms
 pulse_end = 1000 * ms
+pulse_amplitude = 0.8
+baseline_input = 0.0
+
 tau_baseline = 20 * ms
 
-# -------------------
-# Storage
-# -------------------
-all_corr = []
+w_exc = 0.04
+con_prob = 0.2
+noise_sigma = 0.1
+
 all_mean_activity = []
+all_corr = []
 
-first_run_t = None
-first_run_r = None
-lags = None
+representative_W = None
 
 # -------------------
-# Run multiple baseline simulations
+# Run simulations
 # -------------------
 for run_id in range(num_runs):
     start_scope()
 
-    # Reproducible but different random network each run
-    seed(run_id)
-    np.random.seed(run_id)
-
+    current_seed = 10000 + run_id
+    seed(current_seed)
+    np.random.seed(current_seed)
     defaultclock.dt = dt
 
-    # -------------------
-    # Rate-based equations
-    # -------------------
+    W, NE, NI = build_balanced_baseline_connectivity(
+        N=N,
+        exc_percent=50,
+        w_exc=w_exc,
+        con_prob=con_prob,
+    )
+
+    if run_id == 0:
+        representative_W = W.copy()
+
+        row_sums = np.sum(W, axis=1)
+        col_sums = np.sum(W, axis=0)
+
+        print(f"Baseline E/I = {NE}/{NI}")
+        print(f"Total W sum: {np.sum(W):.10f}")
+        print(f"Mean row sum: {np.mean(row_sums):.10f}")
+        print(f"Std row sum: {np.std(row_sums):.10f}")
+        print(f"Mean col sum: {np.mean(col_sums):.10f}")
+        print(f"Std col sum: {np.std(col_sums):.10f}")
+        print(f"Min excitatory weight: {np.min(W[:, :NE]):.6f}")
+        print(f"Max inhibitory weight: {np.max(W[:, NE:]):.6f}")
+
     eqs = '''
     dr/dt = (-r + tanh(total_input))/tau_i : 1
     total_input : 1
     tau_i : second
     '''
 
-    G = NeuronGroup(N, eqs, method='euler')
-    G.r = '0.05 * rand()'
+    G = NeuronGroup(N, eqs, method="euler")
+    G.r = "0.05 * rand()"
     G.tau_i = tau_baseline
     G.total_input = baseline_input
-
-    # recurrent weight matrix
-    W = np.random.normal(0, w_rec / np.sqrt(N), size=(N, N))
-    np.fill_diagonal(W, 0)
 
     @network_operation(dt=defaultclock.dt)
     def update_input():
@@ -76,119 +184,105 @@ for run_id in range(num_runs):
         else:
             input_signal = baseline_input
 
-        G.total_input = input_signal + np.dot(W, G.r)
+        if noise_sigma > 0:
+            noise = noise_sigma * np.random.randn(N)
+        else:
+            noise = 0
 
-    # monitor
-    M = StateMonitor(G, 'r', record=True)
+        G.total_input = input_signal + np.dot(W, G.r) + noise
 
-    # run simulation
+    M = StateMonitor(G, "r", record=True)
+
     run(duration)
 
-    # compute mean activity
-    mean_activity = np.mean(M.r, axis=0)
-
-    # compute autocorrelation
+    mean_activity = np.asarray(np.mean(M.r, axis=0))
     corr = autocorrelation(mean_activity)
 
-    # save representative run (first run) for single-neuron plot
-    if run_id == 0:
-        first_run_t = M.t / ms
-        first_run_r = np.array(M.r)
-        lags = np.arange(len(corr)) * float(defaultclock.dt / ms)
-
-    # store results from each run
     all_mean_activity.append(mean_activity)
     all_corr.append(corr[:1000])
 
-# -------------------
-# Convert to arrays
-# -------------------
-all_mean_activity = np.array(all_mean_activity)
-all_corr = np.array(all_corr)
+    if run_id == 0:
+        time_ms = np.asarray(M.t / ms)
+        lags_ms = np.arange(len(corr)) * float(defaultclock.dt / ms)
 
-# Mean and std across runs
-mean_of_mean_activity = np.mean(all_mean_activity, axis=0)
-std_of_mean_activity = np.std(all_mean_activity, axis=0)
+
+# -------------------
+# Average results
+# -------------------
+all_mean_activity = np.vstack(all_mean_activity)
+all_corr = np.vstack(all_corr)
+
+mean_activity_avg = np.mean(all_mean_activity, axis=0)
+std_activity = np.std(all_mean_activity, axis=0)
 
 mean_corr = np.mean(all_corr, axis=0)
 std_corr = np.std(all_corr, axis=0)
 
+lags_ms = lags_ms[:1000]
 
-def exp_decay(t, tau):
-    return np.exp(-t / tau)
-
-fit_max_lag = 100
-
-corr_curve = mean_corr
-lag_curve = lags[:len(corr_curve)]
-
-mask = (lag_curve > 0) & (lag_curve <= fit_max_lag)
-
-x_fit = lag_curve[mask]
-y_fit = corr_curve[mask]
-
-popt, _ = curve_fit(
-    exp_decay,
-    x_fit,
-    y_fit,
-    p0=(20.0,),
-    bounds=([1], [1000])
+tau_est = estimate_timescale_from_return_to_baseline(
+    mean_activity_avg,
+    time_ms,
+    pulse_start / ms,
+    pulse_end / ms,
 )
 
-tau_eff_baseline = popt[0]
+print("\nEstimated baseline timescale:")
+if np.isnan(tau_est):
+    print("Undefined")
+else:
+    print(f"{tau_est:.2f} ms")
 
-print(
-    f"Baseline intrinsic timescale = {tau_eff_baseline:.2f} ms"
-)
 
 # -------------------
-# Plot 1: representative single-neuron activity
+# Plot 1: mean activity
 # -------------------
 plt.figure(figsize=(10, 6))
-for i in range(5):
-    plt.plot(first_run_t, first_run_r[i], label=f'Neuron {i}')
-plt.axvspan(pulse_start / ms, pulse_end / ms, alpha=0.2, label='Input pulse')
-plt.xlabel('Time (ms)')
-plt.ylabel('Rate activity')
-plt.title('Baseline model: representative single-neuron activity')
+plt.plot(time_ms, mean_activity_avg, label="Mean activity")
+plt.fill_between(
+    time_ms,
+    mean_activity_avg - std_activity,
+    mean_activity_avg + std_activity,
+    alpha=0.2,
+    label="±1 std",
+)
+plt.axvspan(pulse_start / ms, pulse_end / ms, alpha=0.2, label="Input pulse")
+plt.xlabel("Time (ms)")
+plt.ylabel("Mean activity")
+plt.title("Baseline balanced E/I network: mean population activity")
 plt.legend()
 plt.tight_layout()
 
-# -------------------
-# Plot 2: mean network activity across runs
-# -------------------
-plt.figure(figsize=(10, 6))
-plt.plot(first_run_t, mean_of_mean_activity, label='Mean across runs')
-plt.fill_between(
-    first_run_t,
-    mean_of_mean_activity - std_of_mean_activity,
-    mean_of_mean_activity + std_of_mean_activity,
-    alpha=0.3,
-    label='±1 std'
-)
-plt.axvspan(pulse_start / ms, pulse_end / ms, alpha=0.2, label='Input pulse')
-plt.xlabel('Time (ms)')
-plt.ylabel('Mean activity')
-plt.title('Baseline model: mean network activity across runs')
-plt.legend()
-plt.tight_layout()
 
 # -------------------
-# Plot 3: autocorrelation across runs
+# Plot 2: autocorrelation
 # -------------------
 plt.figure(figsize=(10, 6))
-plt.plot(lags[:1000], mean_corr, label='Mean autocorrelation')
+plt.plot(lags_ms, mean_corr, label="Mean autocorrelation")
 plt.fill_between(
-    lags[:1000],
+    lags_ms,
     mean_corr - std_corr,
     mean_corr + std_corr,
-    alpha=0.3,
-    label='±1 std'
+    alpha=0.2,
+    label="±1 std",
 )
-plt.xlabel('Lag (ms)')
-plt.ylabel('Autocorrelation')
-plt.title('Baseline model: autocorrelation across runs')
+plt.xlabel("Lag (ms)")
+plt.ylabel("Autocorrelation")
+plt.title("Baseline balanced E/I network: autocorrelation")
 plt.legend()
+plt.tight_layout()
+
+
+# -------------------
+# Plot 3: connectivity matrix
+# -------------------
+plt.figure(figsize=(7, 6))
+absmax = np.max(np.abs(representative_W))
+plt.imshow(representative_W, cmap="bwr", aspect="auto", vmin=-absmax, vmax=absmax)
+plt.colorbar(label="Connection strength")
+plt.xlabel("Presynaptic neuron j")
+plt.ylabel("Postsynaptic neuron i")
+plt.title("Baseline balanced E/I connectivity matrix")
 plt.tight_layout()
 
 plt.show()
