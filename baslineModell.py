@@ -112,9 +112,9 @@ w_exc = 0.6
 mu = -np.log(np.sqrt(N))
 sigma = 0.8
 
-# Choose noise level
-noise_sigma = 0.05
-# noise_sigma = 0.1
+# noise level
+#noise_sigma = 0.05
+noise_sigma = 0.1
 # noise_sigma = 0.25
 
 ratio = 0.5

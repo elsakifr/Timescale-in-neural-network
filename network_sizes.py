@@ -8,16 +8,44 @@ prefs.codegen.target = "numpy"
 # -------------------
 # Helper functions
 # -------------------
-def autocorrelation(x):
+def autocorrelation(x, max_lag=None, unbiased=False):
     x = np.asarray(x)
     x = x - np.mean(x)
-    corr = np.correlate(x, x, mode='full')
+
+    corr = np.correlate(x, x, mode="full")
     corr = corr[corr.size // 2:]
+
+    if unbiased:
+        n = len(x)
+        overlap = np.arange(n, 0, -1)
+        corr = corr / overlap
 
     if corr[0] == 0:
         return np.full_like(corr, np.nan)
 
-    return corr / corr[0]
+    corr = corr / corr[0]
+
+    if max_lag is not None:
+        corr = corr[:max_lag]
+
+    return corr
+
+
+def find_zero_crossing(corr, lags):
+    crossing_idx = np.where(corr <= 0)[0]
+
+    if len(crossing_idx) == 0:
+        return np.nan
+
+    idx = crossing_idx[0]
+
+    if idx == 0:
+        return lags[0]
+
+    x1, x2 = lags[idx - 1], lags[idx]
+    y1, y2 = corr[idx - 1], corr[idx]
+
+    return x1 - y1 * (x2 - x1) / (y2 - y1)
 
 
 def exp_decay(t, A, tau):
@@ -63,7 +91,6 @@ def estimate_timescale_from_decay(mean_activity, time_ms, pulse_end_ms):
 
 # -------------------
 # Simulation settings
-# Same as baseline / E/I Case 3
 # -------------------
 num_runs = 35
 network_sizes = [50, 100, 200, 500]
@@ -77,12 +104,10 @@ pulse_start = 500 * ms
 pulse_end = 1000 * ms
 tau_baseline = 20 * ms
 
-# Case 3 settings
 w_exc = 0.6
 sigma = 0.8
-noise_sigma = 0.05
+noise_sigma = 0.1
 
-# Baseline E/I ratio: 50/50
 ratio = 0.5
 
 # -------------------
@@ -91,12 +116,19 @@ ratio = 0.5
 results_mean_activity = {}
 results_std_activity = {}
 
-results_mean_corr = {}
-results_std_corr = {}
+results_mean_corr_full = {}
+results_std_corr_full = {}
+results_lags_full = {}
+
+results_mean_corr_post = {}
+results_std_corr_post = {}
+results_lags_post = {}
+
+results_zero_full = {}
+results_zero_post = {}
 
 results_timescale = {}
 results_time = {}
-results_lags = {}
 
 representative_W = {}
 representative_neuron_types = {}
@@ -108,16 +140,14 @@ for N in network_sizes:
     print(f"\nRunning network size N = {N}")
 
     all_mean_activity = []
-    all_corr = []
+    all_corr_full = []
+    all_corr_post = []
 
     num_exc = int(round(ratio * N))
     num_inh = N - num_exc
-
-    # Important: same log-normal scaling idea as baseline
     mu = -np.log(np.sqrt(N))
 
     current_time = None
-    current_lags = None
 
     for run_id in range(num_runs):
         start_scope()
@@ -128,9 +158,6 @@ for N in network_sizes:
 
         defaultclock.dt = dt
 
-        # -------------------
-        # Rate-based equations
-        # -------------------
         eqs = '''
         dr/dt = (-r + tanh(total_input))/tau_i : 1
         total_input : 1
@@ -142,9 +169,6 @@ for N in network_sizes:
         G.tau_i = tau_baseline
         G.total_input = baseline_input
 
-        # -------------------
-        # Define E/I neuron types
-        # -------------------
         neuron_types = np.ones(N)
         neuron_types[num_exc:] = -1
         np.random.shuffle(neuron_types)
@@ -152,26 +176,15 @@ for N in network_sizes:
         exc_cols = np.where(neuron_types == 1)[0]
         inh_cols = np.where(neuron_types == -1)[0]
 
-        # -------------------
-        # Case 3 connectivity:
-        # full connectivity, log-normal magnitudes,
-        # inhibition rescaled so total W sum ≈ 0
-        # -------------------
         W = np.random.lognormal(mean=mu, sigma=sigma, size=(N, N))
-
-        # Remove self-connections before balancing
         np.fill_diagonal(W, 0)
 
-        # Excitatory columns: positive
         W[:, exc_cols] = w_exc * W[:, exc_cols]
 
-        # Balance inhibition using actual sums
         exc_sum = np.sum(W[:, exc_cols])
         inh_sum = np.sum(W[:, inh_cols])
-
         ei_scale = exc_sum / inh_sum
 
-        # Inhibitory columns: negative and scaled
         W[:, inh_cols] = -W[:, inh_cols] * ei_scale
 
         if run_id == 0:
@@ -190,9 +203,6 @@ for N in network_sizes:
             print(f"Mean col sum: {np.mean(col_sums):.10f}")
             print(f"Std col sum: {np.std(col_sums):.10f}")
 
-        # -------------------
-        # External input + recurrent input + noise
-        # -------------------
         @network_operation(dt=defaultclock.dt)
         def update_input():
             if pulse_start <= defaultclock.t < pulse_end:
@@ -201,40 +211,62 @@ for N in network_sizes:
                 input_signal = baseline_input
 
             noise = noise_sigma * np.random.randn(N)
-
             G.total_input = input_signal + np.dot(W, G.r) + noise
 
-        # -------------------
-        # Monitor and run
-        # -------------------
         M = StateMonitor(G, 'r', record=True)
-
         run(duration)
 
+        time_ms = np.asarray(M.t / ms)
         mean_activity = np.asarray(np.mean(M.r, axis=0))
-        corr = np.asarray(autocorrelation(mean_activity))
+
+        # Full-signal autocorrelation
+        corr_full = autocorrelation(mean_activity, unbiased=False)
+
+        # Post-stimulus autocorrelation only
+        post_mask = time_ms >= pulse_end / ms
+        post_activity = mean_activity[post_mask]
+        corr_post = autocorrelation(post_activity, unbiased=False)
 
         if run_id == 0:
-            current_time = np.asarray(M.t / ms)
-            current_lags = np.arange(len(corr)) * float(defaultclock.dt / ms)
+            current_time = time_ms
 
         all_mean_activity.append(mean_activity.copy())
-        all_corr.append(corr[:1000].copy())
+        all_corr_full.append(corr_full.copy())
+        all_corr_post.append(corr_post.copy())
 
     # -------------------
     # Average across runs
     # -------------------
     all_mean_activity = np.vstack(all_mean_activity)
-    all_corr = np.vstack(all_corr)
+
+    min_len_full = min(len(c) for c in all_corr_full)
+    min_len_post = min(len(c) for c in all_corr_post)
+
+    all_corr_full = np.vstack([c[:min_len_full] for c in all_corr_full])
+    all_corr_post = np.vstack([c[:min_len_post] for c in all_corr_post])
 
     results_mean_activity[N] = np.mean(all_mean_activity, axis=0)
     results_std_activity[N] = np.std(all_mean_activity, axis=0)
 
-    results_mean_corr[N] = np.mean(all_corr, axis=0)
-    results_std_corr[N] = np.std(all_corr, axis=0)
+    results_mean_corr_full[N] = np.mean(all_corr_full, axis=0)
+    results_std_corr_full[N] = np.std(all_corr_full, axis=0)
+    results_lags_full[N] = np.arange(len(results_mean_corr_full[N])) * float(dt / ms)
+
+    results_mean_corr_post[N] = np.mean(all_corr_post, axis=0)
+    results_std_corr_post[N] = np.std(all_corr_post, axis=0)
+    results_lags_post[N] = np.arange(len(results_mean_corr_post[N])) * float(dt / ms)
+
+    results_zero_full[N] = find_zero_crossing(
+        results_mean_corr_full[N],
+        results_lags_full[N]
+    )
+
+    results_zero_post[N] = find_zero_crossing(
+        results_mean_corr_post[N],
+        results_lags_post[N]
+    )
 
     results_time[N] = current_time
-    results_lags[N] = current_lags[:1000]
 
     results_timescale[N] = estimate_timescale_from_decay(
         results_mean_activity[N],
@@ -242,26 +274,22 @@ for N in network_sizes:
         pulse_end / ms
     )
 
-
 # -------------------
 # Plot 1: mean population activity
 # -------------------
 plt.figure(figsize=(10, 6))
 
 for N in network_sizes:
-    mean_curve = results_mean_activity[N]
-    std_curve = results_std_activity[N]
-
     plt.plot(
         results_time[N],
-        mean_curve,
+        results_mean_activity[N],
         label=f'N = {N}'
     )
 
     plt.fill_between(
         results_time[N],
-        mean_curve - std_curve,
-        mean_curve + std_curve,
+        results_mean_activity[N] - results_std_activity[N],
+        results_mean_activity[N] + results_std_activity[N],
         alpha=0.15
     )
 
@@ -272,55 +300,66 @@ plt.title('Effect of network size: mean population activity')
 plt.legend()
 plt.tight_layout()
 
-
 # -------------------
-# Plot 2: autocorrelation
+# Plot 2: post-stimulus autocorrelation
 # -------------------
 plt.figure(figsize=(10, 6))
 
 for N in network_sizes:
-    mean_corr = results_mean_corr[N]
-    std_corr = results_std_corr[N]
-
     plt.plot(
-        results_lags[N],
-        mean_corr,
+        results_lags_post[N],
+        results_mean_corr_post[N],
         label=f'N = {N}'
     )
 
     plt.fill_between(
-        results_lags[N],
-        mean_corr - std_corr,
-        mean_corr + std_corr,
+        results_lags_post[N],
+        results_mean_corr_post[N] - results_std_corr_post[N],
+        results_mean_corr_post[N] + results_std_corr_post[N],
         alpha=0.15
     )
 
-plt.xlabel('Lag (ms)')
+plt.axhline(0, color='black', linestyle='--', linewidth=1)
+plt.xlim(0, 1000)
+plt.xlabel('Lag after stimulus offset (ms)')
 plt.ylabel('Autocorrelation')
-plt.title('Effect of network size: autocorrelation')
+plt.title('Effect of network size: post-stimulus autocorrelation')
 plt.legend()
 plt.tight_layout()
 
+# -------------------
+# Plot 3: zoomed post-stimulus autocorrelation
+# -------------------
+plt.figure(figsize=(10, 6))
+
+for N in network_sizes:
+    plt.plot(
+        results_lags_post[N],
+        results_mean_corr_post[N],
+        label=f'N = {N}'
+    )
+
+plt.axhline(0, color='black', linestyle='--', linewidth=1)
+plt.xlim(0, 150)
+plt.xlabel('Lag after stimulus offset (ms)')
+plt.ylabel('Autocorrelation')
+plt.title('Effect of network size: post-stimulus autocorrelation zoom')
+plt.legend()
+plt.tight_layout()
 
 # -------------------
-# Plot 3: estimated post-pulse timescale
+# Plot 4: estimated post-pulse timescale
 # -------------------
 plt.figure(figsize=(8, 5))
 
 valid_N = []
 valid_tau = []
-first_nan = True
 
 for N in network_sizes:
     tau = results_timescale[N]
 
     if np.isnan(tau):
-        if first_nan:
-            plt.scatter(N, 0, marker='x', s=100, label='Undefined timescale')
-            first_nan = False
-        else:
-            plt.scatter(N, 0, marker='x', s=100)
-
+        plt.scatter(N, 0, marker='x', s=100)
         plt.text(N, 5, 'undefined', ha='center')
     else:
         valid_N.append(N)
@@ -334,64 +373,6 @@ plt.ylabel('Estimated timescale (ms)')
 plt.title('Effect of network size: estimated post-pulse time constant')
 plt.legend()
 plt.tight_layout()
-
-
-# -------------------
-# Plot 4: representative connectivity matrices
-# -------------------
-plt.figure(figsize=(12, 10))
-plt.suptitle("Representative Case 3 connectivity matrices for different network sizes", fontsize=16)
-
-# Use common color scale
-absmax = max(np.max(np.abs(representative_W[N])) for N in network_sizes)
-
-for ii, N in enumerate(network_sizes):
-    W_plot = representative_W[N]
-
-    plt.subplot(2, 2, ii + 1)
-    plt.imshow(
-        W_plot,
-        cmap='bwr',
-        aspect='auto',
-        vmin=-absmax,
-        vmax=absmax
-    )
-    plt.colorbar(label='Connection strength')
-    plt.title(f'N = {N}')
-    plt.xlabel('Presynaptic neuron j')
-    plt.ylabel('Postsynaptic neuron i')
-
-plt.tight_layout()
-
-
-# -------------------
-# Plot 5: sorted connectivity matrices
-# -------------------
-plt.figure(figsize=(12, 10))
-plt.suptitle("Sorted Case 3 connectivity matrices for different network sizes", fontsize=16)
-
-for ii, N in enumerate(network_sizes):
-    W_plot = representative_W[N]
-    neuron_types = representative_neuron_types[N]
-
-    sorted_idx = np.argsort(neuron_types)
-    W_sorted = W_plot[sorted_idx][:, sorted_idx]
-
-    plt.subplot(2, 2, ii + 1)
-    plt.imshow(
-        W_sorted,
-        cmap='bwr',
-        aspect='auto',
-        vmin=-absmax,
-        vmax=absmax
-    )
-    plt.colorbar(label='Connection strength')
-    plt.title(f'N = {N}')
-    plt.xlabel('Presynaptic neuron j')
-    plt.ylabel('Postsynaptic neuron i')
-
-plt.tight_layout()
-
 
 # -------------------
 # Print results
@@ -411,5 +392,22 @@ for N in network_sizes:
         print(f"N = {N}: peak={peak:.3f} → baseline={baseline:.3f}, no clear decay")
     else:
         print(f"N = {N}: peak={peak:.3f} → baseline={baseline:.3f}, τ={tau:.2f} ms")
+
+print("\nAutocorrelation zero-crossing diagnostics:")
+for N in network_sizes:
+    z_full = results_zero_full[N]
+    z_post = results_zero_post[N]
+
+    if np.isnan(z_full):
+        full_text = "no zero crossing"
+    else:
+        full_text = f"{z_full:.2f} ms"
+
+    if np.isnan(z_post):
+        post_text = "no zero crossing"
+    else:
+        post_text = f"{z_post:.2f} ms"
+
+    print(f"N = {N}: full-signal zero crossing = {full_text}, post-stimulus zero crossing = {post_text}")
 
 plt.show()
